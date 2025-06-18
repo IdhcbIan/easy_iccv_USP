@@ -23,7 +23,10 @@ def load_triplet(paths):
 
 
 def main(img_dir: Path, steps: int):
-    paths = list(img_dir.glob("*.jpg")) if img_dir.exists() else []
+    # Update to search for both .jpg and .jpeg files
+    paths = []
+    if img_dir.exists():
+        paths = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.jpeg"))
 
     buddy_pool = BuddyPool().to(_model.device if hasattr(_model,'device') else "cpu")
     criterion  = MaxSimLoss()
@@ -61,7 +64,7 @@ def main(img_dir: Path, steps: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--img_dir", type=Path, default=Path("samples"))
+    parser.add_argument("--img_dir", type=Path, default=Path("Flowers/imgs"))
     parser.add_argument("--steps",   type=int,  default=20)
     args = parser.parse_args()
     main(args.img_dir, args.steps)
