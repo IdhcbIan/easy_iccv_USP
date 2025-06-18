@@ -1,0 +1,37 @@
+------------> CLS Paper!! ----------------------------
+
+// New Repo //
+
+https://github.com/vtrivedy/easy_iccv/tree/main
+
+--------------------------
+
+// Base Model //
+
+https://huggingface.co/timm/vit_large_patch14_reg4_dinov2.lvd142m
+
+--------------------------
+Thigs to Look for...
+
+- Low Learning Rate
+- Pooling Size
+
+To Implement:
+
+- Specific Data
+
+
+--------------------------
+// First Run //
+
+Changes:
+
+- Changing DinoV2 from Timm to -> torch.hub.load('facebookresearch/dinov2', model_name)
+
+- Patch Dimension Didint Match the new dino arquitecture so edited BuddyPool to configure automaticaly with model class and size!!
+
+---
+Now I've updated the BuddyPool class to handle both flat patch tokens (B, N, D) and spatial patch tokens (B, H, W, D). This makes it compatible with our modified forward_tokens function.---
+
+
+
