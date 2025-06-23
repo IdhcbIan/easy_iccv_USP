@@ -60,7 +60,8 @@ def load_cub_triplet(class_to_paths: dict[str, list[Path]]):
     """
     cls_pos = random.choice(list(class_to_paths.keys()))
     # escolhe duas imagens diferentes para anchor e positivo
-    a, p = random.sample(class_to_paths[cls_pos], 2)
+    a = random.choice(class_to_paths[cls_pos])
+    p = random.choice(class_to_paths[cls_pos])
     # para negativo, escolhe outra classe
     other = [c for c in class_to_paths if c != cls_pos]
     neg_cls = random.choice(other)

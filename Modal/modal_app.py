@@ -28,8 +28,8 @@ app = modal.App(
 
 @app.function(
     #gpu="any"
-    gpu="T4"
-    #gpu="A100"
+    #gpu="T4"
+    gpu="A100"
     #gpu="A100-80GB"
     #gpu="A100-80GB:4"
 )
