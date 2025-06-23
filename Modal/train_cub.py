@@ -8,9 +8,8 @@ import torch
 import torch.nn.functional as F
 from tqdm import trange, tqdm
 
-from model_utils import forward_tokens, _load_image, _model
-from buddy_pool import BuddyPool
-from maxsim_loss import MaxSimLoss
+from model_utils import _load_image, MultiVectorEncoder
+from maxsim_loss import TripletColbertLoss
 
 
 def parse_cub(root: Path):
@@ -30,7 +29,7 @@ def parse_cub(root: Path):
     img_map = {}
     for line in (root / "images.txt").read_text().splitlines():
         iid, rel = line.split()
-        img_map[int(iid)] = root / "images" / rel
+        img_map[int(iid)] = rel
 
     train_ids = set()
     for line in (root / "train_test_split.txt").read_text().splitlines():
@@ -93,23 +92,21 @@ def get_batch(class_to_paths: dict[str, list[Path]], batch_size: int):
 def evaluate_retrieval_recalls(
     train_paths: dict[str, list[Path]],
     test_paths:  dict[str, list[Path]],
-    buddy_pool:  BuddyPool,
+    encoder:     MultiVectorEncoder,
     device:      torch.device,
     ks:          list[int],
     eval_batch_size: int
 ):
     """
-    Calcular recall em varios k em lotes
-    Embeds da galeria sao calculados uma vez no CPU
-    Queries sao codificadas no dispositivo e retornam ao CPU para calculo de similaridade
+    Calcular recall em varios k em lotes usando MultiVectorEncoder
     """
-    buddy_pool.eval()
-    _model.eval()
+    encoder.eval()
 
-    # montar galeria de embeddings de token de classe no CPU
+    # montar galeria de embeddings usando o encoder
     classes = sorted(train_paths.keys())
     cls2idx = {c: i for i, c in enumerate(classes)}
     gallery_embs, gallery_labels = [], []
+    
     with torch.no_grad():
         for c in classes:
             for p in train_paths[c]:
@@ -118,12 +115,11 @@ def evaluate_retrieval_recalls(
                 if img.ndim == 3:
                     img = img.unsqueeze(0)
                 img = img.to(device)
-                c_tok, _ = forward_tokens(img)      # suposto [1, seq_len, D]
-                # extrair token de classe no indice zero
-                # c_tok tem forma [1, seq_len, D]
-                emb = c_tok[0, 0, :].cpu()          # resulta em [D]
-                gallery_embs.append(emb)
+                emb = encoder(img)  # (1, 10, D)
+                # usar o primeiro token (CLS) como representação
+                gallery_embs.append(emb[0, 0, :].cpu())  # (D,)
                 gallery_labels.append(cls2idx[c])
+    
     # empilhar no formato [N_gallery, D]
     gallery = torch.stack(gallery_embs, dim=0)
     gallery_norm = F.normalize(gallery, dim=1)   # [N_gallery, D]
@@ -147,13 +143,13 @@ def evaluate_retrieval_recalls(
         imgs = torch.cat(imgs, dim=0).to(device)  # [B, C, H, W]
 
         with torch.no_grad():
-            c_tok, _ = forward_tokens(imgs)         # [B, seq_len, D]
-            # extrair token de classe para cada item
-            embs = c_tok[:, 0, :].cpu()             # [B, D]
-            embs_norm = F.normalize(embs, dim=1)    # [B, D] no CPU
+            embs = encoder(imgs)  # [B, 10, D]
+            # usar o primeiro token (CLS) como representação da query
+            query_embs = embs[:, 0, :].cpu()  # [B, D]
+            query_norm = F.normalize(query_embs, dim=1)  # [B, D]
 
         # calcular similaridade via produto interno
-        sims = embs_norm @ gallery_norm.t()       # [B, N_gallery]
+        sims = query_norm @ gallery_norm.t()  # [B, N_gallery]
         topk = sims.topk(max(ks), dim=1).indices.cpu().tolist()
 
         # calcular hits
@@ -167,8 +163,7 @@ def evaluate_retrieval_recalls(
     for k in ks:
         print(f"Recall@{k}: {hits[k] / total:.4f} ({hits[k]}/{total})")
 
-    buddy_pool.train()
-    _model.train()
+    encoder.train()
 
 
 def main(
@@ -182,38 +177,31 @@ def main(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
-    _model.to(device)
-    buddy_pool = BuddyPool().to(device)
+    
+    # Use MultiVectorEncoder like the original (feature extraction only, no training)
+    encoder = MultiVectorEncoder().to(device)
+    encoder.eval()  # Set to eval mode since we're doing feature extraction only
 
-    optimiser = torch.optim.AdamW(
-        list(buddy_pool.parameters()) + list(_model.parameters()),
-        lr=1e-4, weight_decay=1e-5
-    )
-    criterion = MaxSimLoss()
+    # No optimizer needed since MultiVectorEncoder.forward() has @torch.no_grad()
+    # This matches the original implementation which does feature extraction only
+    
+    # Use original loss function (for monitoring/evaluation purposes)
+    criterion = TripletColbertLoss(margin=0.2)
     hist = []
 
     for i in trange(steps, desc="train", unit="step"):
         a, p, n = get_batch(train_paths, batch_size)
         a, p, n = a.to(device), p.to(device), n.to(device)
 
-        c_a, p_a = forward_tokens(a)
-        c_p, p_p = forward_tokens(p)
-        c_n, p_n = forward_tokens(n)
+        # Forward through encoder (no gradients due to @torch.no_grad())
+        emb_a = encoder(a)  # (B, 10, D)
+        emb_p = encoder(p)  # (B, 10, D)
+        emb_n = encoder(n)  # (B, 10, D)
 
-        b_a = buddy_pool(c_a, p_a)
-        b_p = buddy_pool(c_p, p_p)
-        b_n = buddy_pool(c_n, p_n)
-
-        t_a = torch.cat([c_a, b_a], dim=1)
-        t_p = torch.cat([c_p, b_p], dim=1)
-        t_n = torch.cat([c_n, b_n], dim=1)
-
-        loss = criterion(t_a, t_p, t_n)
-        hist.append(loss.item())
-
-        optimiser.zero_grad()
-        loss.backward()
-        optimiser.step()
+        # Compute ColBERT loss (for monitoring only, no backprop)
+        with torch.no_grad():
+            loss = criterion(emb_a, emb_p, emb_n)
+            hist.append(loss.item())
 
         if (i + 1) % report_interval == 0:
             avg = sum(hist[-report_interval:]) / report_interval
@@ -223,7 +211,7 @@ def main(
     print(f"Avg loss: {sum(hist) / len(hist):.4f}")
 
     evaluate_retrieval_recalls(
-        train_paths, test_paths, buddy_pool, device,
+        train_paths, test_paths, encoder, device,
         ks=[1, 2, 4], eval_batch_size=eval_batch_size
     )
 

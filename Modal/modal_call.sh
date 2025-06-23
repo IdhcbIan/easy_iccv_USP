@@ -11,3 +11,10 @@ modal run modal_app_cub.py \
   --batch-size 4 \
   --report-interval 2 \
   --eval-batch-size 4
+
+modal run modal_app_cub.py \
+  --cub-root /mnt/data/CUB_200_2011 \
+  --steps 100 \
+  --batch-size 64 \
+  --report-interval 2 \
+  --eval-batch-size 64

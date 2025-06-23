@@ -5,6 +5,27 @@ from __future__ import annotations
 import torch
 from torch import nn
 import math
+from einops import rearrange
+
+# Configuration for ROI pooling
+class CFG:
+    roi_side = 3  # 3x3 ROI pooling like original
+
+def _buddy_pool(cue, patches2d):
+    """Original buddy pooling implementation matching aug_cls_repo"""
+    B, H, W, d = patches2d.shape
+    flat = rearrange(patches2d, "b h w d -> b (h w) d")
+    sim  = torch.matmul(cue.unsqueeze(1), flat.transpose(1, 2)).squeeze(1)
+    idx  = sim.argmax(dim=-1)
+    h = idx // W
+    w = idx %  W
+    r = CFG.roi_side // 2
+    roi = []
+    for b in range(B):
+        hs = slice(max(0, h[b]-r), min(H, h[b]+r+1))
+        ws = slice(max(0, w[b]-r), min(W, w[b]+r+1))
+        roi.append(patches2d[b, hs, ws, :].mean(dim=(0, 1)))
+    return torch.stack(roi)
 
 
 class BuddyPool(nn.Module):
@@ -12,69 +33,24 @@ class BuddyPool(nn.Module):
 
     def forward(self, cue: torch.Tensor, patches: torch.Tensor) -> torch.Tensor:
         """
-        cue:     (B, 5, D)
-        patches: (B, N, D) - can be either flat (B, N, D) or spatial (B, H, W, D)
+        cue:     (B, 5, D) - CLS + 4 register tokens
+        patches: (B, H, W, D) - spatial patch tokens
         returns: (B, 5, D) – one Buddy per cue
         """
         b, k, d = cue.shape
         
-        # Check if patches are already in spatial format or flat
-        if len(patches.shape) == 4:
-            # Already in spatial format (B, H, W, D)
-            _, h, w, _ = patches.shape
-        else:
-            # Flat format (B, N, D) - reshape to spatial
+        # Ensure patches are in spatial format (B, H, W, D)
+        if len(patches.shape) == 3:
+            # If flat (B, N, D), reshape to spatial
             _, n, _ = patches.shape
-            # Try to find factors that are close to square
-            h = int(math.sqrt(n))
-            w = n // h
+            # Calculate grid size (assuming square grid)
+            h = w = int(math.sqrt(n))
             if h * w != n:
-                # If we can't get exact factors, use a simple approach
-                # Just create a dummy spatial dimension and use the flat approach
-                h, w = 1, n
+                raise ValueError(f"Cannot reshape {n} patches to square grid")
+            patches = patches.view(b, h, w, d)
         
-        cue_n = torch.nn.functional.normalize(cue, dim=-1)
+        # Apply buddy pooling for each cue token
+        rois = torch.stack([_buddy_pool(cue[:, i], patches)
+                           for i in range(k)], dim=1)
         
-        # Handle different input formats
-        if len(patches.shape) == 4:
-            # Original spatial format
-            patches_n = torch.nn.functional.normalize(patches, dim=-1)
-            flat = patches_n.view(b, h*w, d)  # (B, HW, D)
-        else:
-            # Already flat
-            flat = torch.nn.functional.normalize(patches, dim=-1)  # (B, N, D)
-        
-        sims = torch.einsum("bkd,bnd->bkn", cue_n, flat)   # (B, 5, HW)
-        
-        # Find nearest neighbors
-        idx = sims.argmax(dim=-1)          # nearest patch index → (B, 5)
-        
-        # For flat patches, we'll use the top-K nearest neighbors instead of spatial neighbors
-        if len(patches.shape) != 4:
-            # Get top 9 neighbors for each cue
-            _, top_indices = torch.topk(sims, k=9, dim=-1)  # (B, 5, 9)
-            
-            # Gather the features for these neighbors
-            # Reshape for gather: (B, 5, 9, D)
-            roi = torch.zeros(b, k, 9, d, device=cue.device)
-            
-            for i in range(b):
-                for j in range(k):
-                    roi[i, j] = flat[i, top_indices[i, j]]
-            
-            # Average the 9 neighbors
-            roi = roi.mean(dim=2)  # (B, 5, D)
-            return roi
-        
-        # Original spatial approach
-        y, x = idx // w, idx % w
-        
-        pad = torch.nn.functional.pad(patches, (0,0,1,1,1,1))  # (B,H+2,W+2,D)
-        y, x = y+1, x+1                                        # offset for padding
-        
-        roi = torch.zeros_like(cue)
-        for dy in (-1,0,1):
-            for dx in (-1,0,1):
-                roi += pad[:, y+dy, x+dx, :]
-        roi /= 9.0
-        return roi
+        return rois

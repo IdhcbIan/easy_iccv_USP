@@ -5,14 +5,13 @@ import torch
 import torch.nn.functional as F
 from tqdm import trange
 
-from model_utils import forward_tokens, _load_image, _model
-from buddy_pool import BuddyPool
-from maxsim_loss import MaxSimLoss
+from model_utils import _load_image, MultiVectorEncoder
+from maxsim_loss import TripletColbertLoss
 
 # Build Modal Image including local Python source code
 image = (
   modal.Image.debian_slim()
-    .pip_install("torch","torchvision","tqdm")
+    .pip_install("torch","torchvision","tqdm","timm==0.9.12","einops==0.7.0","pillow")
     .add_local_file("model_utils.py",   "/root/model_utils.py")
     .add_local_file("buddy_pool.py",    "/root/buddy_pool.py")
     .add_local_file("maxsim_loss.py",   "/root/maxsim_loss.py")
@@ -29,9 +28,10 @@ app = modal.App(
 @app.function(
     #gpu="any"
     #gpu="T4"
-    gpu="A100"
+    gpu="A100",
     #gpu="A100-80GB"
     #gpu="A100-80GB:4"
+    timeout=3600  # 1 hour timeout instead of default 5 minutes
 )
 def main(
     cub_root: str = "/mnt/data/Flowers_converted",
@@ -43,9 +43,11 @@ def main(
     """
     Train CUB triplet model on Modal and evaluate recall@k.
     """
+    print("Starting Modal function...")
     cub_root = Path(cub_root)
 
     def parse_cub(root: Path):
+        print("Parsing CUB metadata...")
         cls_map = {}
         for line in (root / "classes.txt").read_text().splitlines():
             cid, cname = line.split()
@@ -75,11 +77,16 @@ def main(
 
         train_paths = {c: ps for c, ps in train_paths.items() if len(ps) >= 2}
         test_paths  = {c: ps for c, ps in test_paths.items() if c in train_paths and len(ps) >= 1}
+        
+        print(f"Found {len(train_paths)} classes for training")
+        print(f"Found {len(test_paths)} classes for testing")
         return train_paths, test_paths
 
     def load_cub_triplet(class_to_paths: dict[str, list[Path]]):
         cls_pos = random.choice(list(class_to_paths.keys()))
-        a, p = random.sample(class_to_paths[cls_pos], 2)
+        # escolhe anchor e positivo independentemente da mesma classe (podem ser iguais ou diferentes)
+        a = random.choice(class_to_paths[cls_pos])
+        p = random.choice(class_to_paths[cls_pos])
         neg_cls = random.choice([c for c in class_to_paths if c != cls_pos])
         n = random.choice(class_to_paths[neg_cls])
         return a, p, n
@@ -98,14 +105,20 @@ def main(
         return torch.stack(anchors), torch.stack(positives), torch.stack(negatives)
 
     def evaluate_retrieval_recalls(
-        train_paths, test_paths, buddy_pool, device, ks, eval_batch_size
+        train_paths, test_paths, encoder, device, ks, eval_batch_size
     ):
-        buddy_pool.eval()
-        _model.eval()
+        print("Setting encoder to eval mode...")
+        encoder.eval()
 
         classes = sorted(train_paths.keys())
         cls2idx = {c: i for i, c in enumerate(classes)}
         gallery_embs, gallery_labels = [], []
+        
+        print("Building gallery embeddings...")
+        total_gallery_images = sum(len(paths) for paths in train_paths.values())
+        print(f"Processing {total_gallery_images} gallery images...")
+        
+        processed = 0
         with torch.no_grad():
             for c in classes:
                 for p in train_paths[c]:
@@ -113,15 +126,24 @@ def main(
                     if img.ndim == 3:
                         img = img.unsqueeze(0)
                     img = img.to(device)
-                    c_tok, _ = forward_tokens(img)
-                    gallery_embs.append(c_tok[0, 0, :].cpu())
+                    emb = encoder(img)  # (1, 10, D)
+                    # usar o primeiro token (CLS) como representação
+                    gallery_embs.append(emb[0, 0, :].cpu())  # (D,)
                     gallery_labels.append(cls2idx[c])
+                    
+                    processed += 1
+                    if processed % 100 == 0:
+                        print(f"Processed {processed}/{total_gallery_images} gallery images")
+        
         gallery = torch.stack(gallery_embs, dim=0)
         gallery_norm = F.normalize(gallery, dim=1)
+        print(f"Gallery built: {gallery.shape}")
 
         test_items = [(cls2idx[c], p) for c, paths in test_paths.items() for p in paths]
         total = len(test_items)
         hits = {k: 0 for k in ks}
+        
+        print(f"Evaluating {total} test images...")
 
         for i in range(0, total, eval_batch_size):
             batch = test_items[i:i+eval_batch_size]
@@ -135,68 +157,74 @@ def main(
             imgs = torch.cat(imgs, dim=0).to(device)
 
             with torch.no_grad():
-                c_tok, _ = forward_tokens(imgs)
-                embs = c_tok[:, 0, :].cpu()
-                embs_norm = F.normalize(embs, dim=1)
+                embs = encoder(imgs)  # [B, 10, D]
+                # usar o primeiro token (CLS) como representação da query
+                query_embs = embs[:, 0, :].cpu()  # [B, D]
+                query_norm = F.normalize(query_embs, dim=1)  # [B, D]
 
-            sims = embs_norm @ gallery_norm.t()
+            sims = query_norm @ gallery_norm.t()
             topk = sims.topk(max(ks), dim=1).indices.cpu().tolist()
 
             for k in ks:
                 for qi, row in enumerate(topk):
                     if any(gallery_labels[idx] == labels[qi].item() for idx in row[:k]):
                         hits[k] += 1
+            
+            if (i + eval_batch_size) % (eval_batch_size * 10) == 0:
+                print(f"Evaluated {min(i + eval_batch_size, total)}/{total} test images")
 
         for k in ks:
             print(f"Recall@{k}: {hits[k] / total:.4f} ({hits[k]}/{total})")
 
-        buddy_pool.train()
-        _model.train()
+        encoder.train()
 
     # Running training
+    print("Setting up training...")
     train_paths, test_paths = parse_cub(cub_root)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
-    _model.to(device)
-    buddy_pool = BuddyPool().to(device)
+    
+    # Use MultiVectorEncoder like the original (feature extraction only, no training)
+    print("Loading MultiVectorEncoder (this may take a while for first download)...")
+    encoder = MultiVectorEncoder().to(device)
+    encoder.eval()  # Set to eval mode since we're doing feature extraction only
+    print("Model loaded successfully!")
 
-    optimiser = torch.optim.AdamW(
-        list(buddy_pool.parameters()) + list(_model.parameters()),
-        lr=1e-4, weight_decay=1e-5
-    )
-    criterion = MaxSimLoss()
+    # No optimizer needed since MultiVectorEncoder.forward() has @torch.no_grad()
+    # This matches the original implementation which does feature extraction only
+    
+    # Use original loss function (for monitoring/evaluation purposes)
+    criterion = TripletColbertLoss(margin=0.2)
     hist = []
 
+    print(f"Starting training loop with {steps} steps...")
     for i in trange(steps, desc="train", unit="step"):
         a, p, n = get_batch(train_paths, batch_size)
         a, p, n = a.to(device), p.to(device), n.to(device)
 
-        c_a, p_a = forward_tokens(a)
-        c_p, p_p = forward_tokens(p)
-        c_n, p_n = forward_tokens(n)
+        # Forward through encoder (no gradients due to @torch.no_grad())
+        emb_a = encoder(a)  # (B, 10, D)
+        emb_p = encoder(p)  # (B, 10, D)
+        emb_n = encoder(n)  # (B, 10, D)
 
-        b_a = buddy_pool(c_a, p_a)
-        b_p = buddy_pool(c_p, p_p)
-        b_n = buddy_pool(c_n, p_n)
-
-        t_a = torch.cat([c_a, b_a], dim=1)
-        t_p = torch.cat([c_p, b_p], dim=1)
-        t_n = torch.cat([c_n, b_n], dim=1)
-
-        loss = criterion(t_a, t_p, t_n)
-        hist.append(loss.item())
-        optimiser.zero_grad()
-        loss.backward()
-        optimiser.step()
+        # Compute ColBERT loss (for monitoring only, no backprop)
+        with torch.no_grad():
+            loss = criterion(emb_a, emb_p, emb_n)
+            hist.append(loss.item())
 
         if (i + 1) % report_interval == 0:
             avg = sum(hist[-report_interval:]) / report_interval
             print(f"[step {i+1:4d}] avg loss: {avg:.4f}")
 
-    # <— add this
+    print(f"Final loss: {hist[-1]:.4f}")
+    print(f"Avg loss: {sum(hist) / len(hist):.4f}")
+
+    # Evaluate model
+    print("Starting evaluation...")
     evaluate_retrieval_recalls(
-        train_paths, test_paths, buddy_pool, device,
+        train_paths, test_paths, encoder, device,
         ks=[1, 2, 4], eval_batch_size=eval_batch_size
     )
+    print("Evaluation complete!")
 
 
