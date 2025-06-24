@@ -295,7 +295,8 @@ def main(
     print("🎯 Final evaluation:")
     evaluate_retrieval_recalls(
         train_paths, test_paths, model, device,
-        ks=[1, 2, 4, 8], eval_batch_size=eval_batch_size
+        #ks=[1, 2, 4, 8], eval_batch_size=eval_batch_size
+        ks=[1, 2, 4], eval_batch_size=eval_batch_size
     )
     
     print("✅ Training complete!")
