@@ -292,7 +292,9 @@ def main(
                 )
 
     # Final comprehensive evaluation
+    print("--------------------------------")
     print("🎯 Final evaluation:")
+    print(f"Final loss: {hist[-1]:.8f}")
     evaluate_retrieval_recalls(
         train_paths, test_paths, model, device,
         #ks=[1, 2, 4, 8], eval_batch_size=eval_batch_size
