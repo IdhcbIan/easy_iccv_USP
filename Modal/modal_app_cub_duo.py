@@ -320,7 +320,8 @@ def main(
         
         # Update scheduler every few steps, not every step
         if i % 10 == 0:
-            scheduler.step(loss.item())
+            pass
+            #scheduler.step(loss.item())
 
         hist.append(loss.item())
 
