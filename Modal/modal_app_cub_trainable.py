@@ -125,7 +125,8 @@ def _load_image(path):
 
 
 @app.function(
-    gpu="A100-80GB",
+    gpu="A100-80GB:2",
+    #gpu="A100-80GB:4"
     timeout=3600  # 1 hour timeout
 )
 def main(

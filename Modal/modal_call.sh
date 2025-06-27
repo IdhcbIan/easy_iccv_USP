@@ -15,6 +15,14 @@ modal run modal_app_cub.py \
 modal run modal_app_cub.py \
   --cub-root /mnt/data/CUB_200_2011 \
   --steps 100 \
+  --batch-size 128 \
+  --report-interval 10 \
+  --eval-batch-size 100
+
+
+modal run modal_app_roxford_duo.py::main \
+  --roxford-root /mnt/data/roxford5k_converted \
+  --steps 20 \
   --batch-size 64 \
-  --report-interval 2 \
-  --eval-batch-size 64
+  --report-interval 50 \
+  --eval-batch-size 20
