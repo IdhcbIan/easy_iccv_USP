@@ -39,12 +39,12 @@ class TrainableMultiVectorEncoder(nn.Module):
         # Configuration matching original
         self.embed_dim = 768
         self.num_registers = 4
-        self.img_size = 224
         #self.img_size = 518
+        self.img_size = 224
         self.roi_side = 3
         
-        # Create the model - trainable
-        self.backbone = timm.create_model(MODEL_NAME, pretrained=True, num_classes=0)
+        # Create the model - trainable with correct image size
+        self.backbone = timm.create_model(MODEL_NAME, pretrained=True, num_classes=0, img_size=self.img_size)
         
         # Add a small projection layer to make it clearly trainable
         self.projection = nn.Linear(self.embed_dim, self.embed_dim)
@@ -116,42 +116,42 @@ class TripletColbertLoss(nn.Module):
 
 
 def _load_image(path):
-    """Load a PIL image and preprocess it."""
+    """Load a PIL image and preprocess it to tensor."""
     preprocess = transforms.Compose([
         transforms.Resize(256),
-        transforms.RandomResizedCrop(518),  # Training augmentation
+        transforms.RandomResizedCrop(224),  # Training augmentation - match img_size
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                            std=[0.229, 0.224, 0.225]),
     ])
     img = Image.open(path).convert("RGB")
-    return preprocess(img)
+    return preprocess(img)  # Returns tensor
 
 
 @app.function(
-    gpu="A100-80GB",  # 2 A100-80GB GPUs
-    #gpu="A100-80GB:4",  # 2 A100-80GB GPUs
+    #gpu="A100-80GB:4",  # 4 A100-80GB GPUs
+    gpu="A100-80GB:2",  # 4 A100-80GB GPUs
     timeout=3600  # 1 hour timeout
 )
 def main(
     cub_root: str = "/mnt/data/CUB_200_2011",
-    steps: int = 80,
-    batch_size: int = 55,
+    steps: int = 200,
+    batch_size: int = 256,
     report_interval: int = 1,
-    eval_batch_size: int = 20,  # Larger eval batch thanks to 2 GPUs
-    #lr: float = 1e-5  # Original learning rate
+    eval_batch_size: int = 100,  # Base eval batch size (will be multiplied by num_gpus)
+    lr: float = 1e-5  # Lower learning rate for fine-tuning
     #lr: float = 5e-6  # Lower learning rate for fine-tuning
-    lr: float = 3e-4  # From previous experiments
-    #lr: float = 3e-5  # 
+    #lr: float = 3e-4  # Lower learning rate for fine-tuning
+    #lr: float = 3e-5  # Lower learning rate for fine-tuning
 ):
     """
-    Train CUB triplet model on Modal with 2 A100 GPUs.
+    Train CUB triplet model on Modal with multiple A100 GPUs.
     Simple FP32 training matching original aug_cls_repo approach.
     """
     # Setup multi-GPU environment
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     
-    cub_root = Path(cub_root)
+    cub_root_path = Path(cub_root)
 
     def parse_cub(root: Path):
         cls_map = {}
@@ -204,23 +204,39 @@ def main(
                 lst.append(img)
         return torch.stack(anchors), torch.stack(positives), torch.stack(negatives)
 
-    def evaluate_retrieval_recalls(train_paths, test_paths, model, device, ks, eval_batch_size):
+    def evaluate_retrieval_recalls(train_paths, test_paths, model, device, ks, eval_batch_size, num_gpus):
         model.eval()
+        
+        # Calculate effective evaluation batch size for multi-GPU
+        effective_eval_batch_size = eval_batch_size * num_gpus
+        print(f"🔍 Evaluation using effective batch size: {effective_eval_batch_size} (base: {eval_batch_size} × {num_gpus} GPUs)")
         
         classes = sorted(train_paths.keys())
         cls2idx = {c: i for i, c in enumerate(classes)}
         gallery_embs, gallery_labels = [], []
         
-        # Build gallery from training set
+        # Build gallery from training set with batched processing
         with torch.no_grad():
-            for c in classes:
-                for p in train_paths[c][:5]:  # Limit to 5 per class for speed
-                    img = _load_image(p).unsqueeze(0).to(device)
+            gallery_items = [(c, p) for c in classes for p in train_paths[c][:5]]  # Limit to 5 per class for speed
+            
+            for i in trange(0, len(gallery_items), effective_eval_batch_size, desc="Building gallery", unit="batch"):
+                batch = gallery_items[i:i+effective_eval_batch_size]
+                imgs = []
+                batch_labels = []
+                
+                for c, p in batch:
+                    img = _load_image(p)  # Already returns tensor
+                    imgs.append(img)
+                    batch_labels.append(cls2idx[c])
+                
+                if imgs:  # Only process if we have images
+                    imgs = torch.stack(imgs).to(device)
+                    embs = model(imgs)
                     
-                    emb = model(img)
-                    
-                    gallery_embs.append(emb[0, 0, :].cpu())  # Use CLS token
-                    gallery_labels.append(cls2idx[c])
+                    # Extract CLS tokens and add to gallery
+                    for j, emb in enumerate(embs):
+                        gallery_embs.append(emb[0, :].cpu())  # Use CLS token
+                        gallery_labels.append(batch_labels[j])
         
         gallery = torch.stack(gallery_embs, dim=0)
         gallery_norm = F.normalize(gallery, dim=1)
@@ -229,12 +245,13 @@ def main(
         total = len(test_items)
         hits = {k: 0 for k in ks}
 
-        for i in trange(0, total, eval_batch_size, desc="eval", unit="batch"):
-            batch = test_items[i:i+eval_batch_size]
+        # Process test queries with effective batch size
+        for i in trange(0, total, effective_eval_batch_size, desc="Evaluating queries", unit="batch"):
+            batch = test_items[i:i+effective_eval_batch_size]
             labels = torch.tensor([lbl for lbl, _ in batch])
             imgs = []
             for _, p in batch:
-                img = _load_image(p)
+                img = _load_image(p)  # Already returns tensor
                 imgs.append(img)
             imgs = torch.stack(imgs).to(device)
 
@@ -258,7 +275,7 @@ def main(
         model.train()
 
     # Initialize everything
-    train_paths, test_paths = parse_cub(cub_root)
+    train_paths, test_paths = parse_cub(cub_root_path)
     
     # Setup multi-GPU with DistributedDataParallel
     num_gpus = torch.cuda.device_count()
@@ -289,6 +306,7 @@ def main(
     print(f"🎯 Effective batch size: {effective_batch_size} (per_gpu: {batch_size}, gpus: {num_gpus})")
     
     # Setup optimizer and loss with stability improvements
+    #optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     
     # Use a stable scheduler instead of CosineAnnealingLR
@@ -339,20 +357,21 @@ def main(
                 print("📊 Quick evaluation:")
                 evaluate_retrieval_recalls(
                     train_paths, test_paths, model, device,
-                    ks=[1, 4], eval_batch_size=eval_batch_size
+                    ks=[1, 4], eval_batch_size=eval_batch_size, num_gpus=num_gpus
                 )
             """
 
     # Final comprehensive evaluation
     print("--------------------------------")
     print("🎯 Final evaluation:")
+    print(f"Eval batch size: {eval_batch_size * num_gpus}")
     print(f"Final loss: {hist[-1]:.8f}")
     evaluate_retrieval_recalls(
         train_paths, test_paths, model, device,
-        ks=[1, 2, 4], eval_batch_size=eval_batch_size
+        ks=[1, 2, 4], eval_batch_size=eval_batch_size, num_gpus=num_gpus
     )
     
-    print("✅ 2-GPU FP32 Training complete!")
+    print(f"✅ Multi-GPU ({num_gpus} GPUs) FP32 Training complete!")
     return {"final_loss": hist[-1] if hist else 0.0, "avg_final_loss": sum(hist[-10:]) / 10 if len(hist) >= 10 else 0.0}
 
 
